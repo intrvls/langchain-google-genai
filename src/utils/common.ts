@@ -1,0 +1,1017 @@
+import {
+  type Content,
+  type Part,
+  type Tool as GoogleGenerativeAITool,
+  type FunctionDeclaration as GenerativeAIFunctionDeclaration,
+  type GenerateContentResponse,
+} from "@google/genai";
+import {
+  AIMessage,
+  AIMessageChunk,
+  BaseMessage,
+  ChatMessage,
+  ContentBlock,
+  ToolMessage,
+  ToolMessageChunk,
+  MessageContent,
+  MessageContentComplex,
+  UsageMetadata,
+  isAIMessage,
+  isBaseMessage,
+  isToolMessage,
+  StandardContentBlockConverter,
+  parseBase64DataUrl,
+  convertToProviderContentBlock,
+  isDataContentBlock,
+  InputTokenDetails,
+} from "@langchain/core/messages";
+import {
+  ChatGeneration,
+  ChatGenerationChunk,
+  ChatResult,
+} from "@langchain/core/outputs";
+import { isLangChainTool } from "@langchain/core/utils/function_calling";
+import { isOpenAITool } from "@langchain/core/language_models/base";
+import { ToolCallChunk } from "@langchain/core/messages/tool";
+import { v4 as uuidv4 } from "uuid";
+import {
+  jsonSchemaToGeminiParameters,
+  schemaToGenerativeAIParameters,
+} from "./zod_to_genai_parameters.js";
+import {
+  GoogleGenerativeAIPart,
+  GoogleGenerativeAIToolType,
+} from "../types.js";
+import { assertNoEmptyStringEnums } from "./validate_schema.js";
+
+export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
+  "__gemini_function_call_thought_signatures__";
+const DUMMY_SIGNATURE =
+  "ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==";
+
+const iife = (fn: () => string) => fn();
+
+export function getMessageAuthor(message: BaseMessage) {
+  if (ChatMessage.isInstance(message)) {
+    return message.role;
+  }
+  return message.type;
+}
+
+/**
+ * Maps a message type to a Google Generative AI chat author.
+ * @param message The message to map.
+ * @param model The model to use for mapping.
+ * @returns The message type mapped to a Google Generative AI chat author.
+ */
+export function convertAuthorToRole(author: string): string {
+  switch (author) {
+    /**
+     *  Note: Gemini currently is not supporting system messages
+     *  we will convert them to human messages and merge with following
+     * */
+    case "supervisor":
+    case "ai":
+    case "model":
+      return "model";
+    case "system":
+      return "system";
+    case "human":
+      return "user";
+    case "tool":
+    case "function":
+      return "function";
+    default:
+      throw new Error(`Unknown / unsupported author: ${author}`);
+  }
+}
+
+function messageContentMedia(content: MessageContentComplex): Part {
+  if ("mimeType" in content && "data" in content) {
+    return {
+      inlineData: {
+        mimeType: content.mimeType,
+        data: content.data,
+      },
+    };
+  }
+  if ("mimeType" in content && "fileUri" in content) {
+    return {
+      fileData: {
+        mimeType: content.mimeType,
+        fileUri: content.fileUri,
+      },
+    };
+  }
+
+  throw new Error("Invalid media content");
+}
+
+function inferToolNameFromPreviousMessages(
+  message: ToolMessage | ToolMessageChunk,
+  previousMessages: BaseMessage[]
+): string | undefined {
+  return previousMessages
+    .map((msg) => {
+      if (isAIMessage(msg)) {
+        return msg.tool_calls ?? [];
+      }
+      return [];
+    })
+    .flat()
+    .find((toolCall) => {
+      return toolCall.id === message.tool_call_id;
+    })?.name;
+}
+
+/**
+ * Converts a ContentBlock.Multimodal block (image, video, audio, file)
+ * to the appropriate Google Generative AI Part format.
+ *
+ * Handles three data record variants:
+ *  - DataRecordBase64: has `data` property → InlineDataPart
+ *  - DataRecordUrl: has `url` property → FileDataPart (or InlineDataPart for data: URLs)
+ *  - DataRecordFileId: has `fileId` property → not directly supported, throws
+ */
+function _multimodalContentBlockToPart(
+  block: ContentBlock.Multimodal.Data,
+  defaultMimeType: string
+): Part {
+  if ("data" in block && block.data !== undefined) {
+    // DataRecordBase64: inline base64 data
+    const data =
+      // oxlint-disable-next-line no-instanceof/no-instanceof
+      block.data instanceof Uint8Array
+        ? btoa(String.fromCharCode(...block.data))
+        : block.data;
+    return {
+      inlineData: {
+        mimeType: block.mimeType || defaultMimeType,
+        data,
+      },
+    };
+  }
+
+  if ("url" in block && block.url !== undefined) {
+    // DataRecordUrl: check if it's a data: URL first
+    const parsed = parseBase64DataUrl({ dataUrl: block.url });
+    if (parsed) {
+      return {
+        inlineData: {
+          mimeType: parsed.mime_type,
+          data: parsed.data,
+        },
+      };
+    }
+    // Regular URL → fileData
+    return {
+      fileData: {
+        mimeType: block.mimeType || defaultMimeType,
+        fileUri: block.url,
+      },
+    };
+  }
+
+  if ("fileId" in block && block.fileId !== undefined) {
+    throw new Error(
+      `ContentBlock.Multimodal fileId is not supported by Google Generative AI. ` +
+        `Use a URL or base64 data instead.`
+    );
+  }
+
+  throw new Error(
+    `Invalid multimodal content block: must have "data", "url", or "fileId" property. ` +
+      `Received: ${JSON.stringify(block)}`
+  );
+}
+
+function _getStandardContentBlockConverter(isMultimodalModel: boolean) {
+  const standardContentBlockConverter: StandardContentBlockConverter<{
+    text: Part;
+    image: Part;
+    audio: Part;
+    file: Part;
+  }> = {
+    providerName: "Google Gemini",
+
+    fromStandardTextBlock(block) {
+      return {
+        text: block.text,
+      };
+    },
+
+    fromStandardImageBlock(block): Part {
+      if (!isMultimodalModel) {
+        throw new Error("This model does not support images");
+      }
+      if (block.source_type === "url") {
+        const data = parseBase64DataUrl({ dataUrl: block.url });
+        if (data) {
+          return {
+            inlineData: {
+              mimeType: data.mime_type,
+              data: data.data,
+            },
+          };
+        } else {
+          return {
+            fileData: {
+              mimeType: block.mime_type ?? "",
+              fileUri: block.url,
+            },
+          };
+        }
+      }
+
+      if (block.source_type === "base64") {
+        return {
+          inlineData: {
+            mimeType: block.mime_type ?? "",
+            data: block.data,
+          },
+        };
+      }
+
+      throw new Error(`Unsupported source type: ${block.source_type}`);
+    },
+
+    fromStandardAudioBlock(block): Part {
+      if (!isMultimodalModel) {
+        throw new Error("This model does not support audio");
+      }
+      if (block.source_type === "url") {
+        const data = parseBase64DataUrl({ dataUrl: block.url });
+        if (data) {
+          return {
+            inlineData: {
+              mimeType: data.mime_type,
+              data: data.data,
+            },
+          };
+        } else {
+          return {
+            fileData: {
+              mimeType: block.mime_type ?? "",
+              fileUri: block.url,
+            },
+          };
+        }
+      }
+
+      if (block.source_type === "base64") {
+        return {
+          inlineData: {
+            mimeType: block.mime_type ?? "",
+            data: block.data,
+          },
+        };
+      }
+
+      throw new Error(`Unsupported source type: ${block.source_type}`);
+    },
+
+    fromStandardFileBlock(block): Part {
+      if (!isMultimodalModel) {
+        throw new Error("This model does not support files");
+      }
+      if (block.source_type === "text") {
+        return {
+          text: block.text,
+        };
+      }
+      if (block.source_type === "url") {
+        const data = parseBase64DataUrl({ dataUrl: block.url });
+        if (data) {
+          return {
+            inlineData: {
+              mimeType: data.mime_type,
+              data: data.data,
+            },
+          };
+        } else {
+          return {
+            fileData: {
+              mimeType: block.mime_type ?? "",
+              fileUri: block.url,
+            },
+          };
+        }
+      }
+
+      if (block.source_type === "base64") {
+        return {
+          inlineData: {
+            mimeType: block.mime_type ?? "",
+            data: block.data,
+          },
+        };
+      }
+      throw new Error(`Unsupported source type: ${block.source_type}`);
+    },
+  };
+  return standardContentBlockConverter;
+}
+
+function _convertLangChainContentToPart(
+  content: MessageContentComplex,
+  isMultimodalModel: boolean
+): Part | undefined {
+  if (isDataContentBlock(content)) {
+    return convertToProviderContentBlock(
+      content,
+      _getStandardContentBlockConverter(isMultimodalModel)
+    );
+  }
+
+  if (content.type === "text") {
+    return { text: content.text };
+  } else if (content.type === "executableCode") {
+    return { executableCode: content.executableCode };
+  } else if (content.type === "codeExecutionResult") {
+    return { codeExecutionResult: content.codeExecutionResult };
+  } else if (content.type === "image_url") {
+    if (!isMultimodalModel) {
+      throw new Error(`This model does not support images`);
+    }
+    let source;
+    if (typeof content.image_url === "string") {
+      source = content.image_url;
+    } else if (
+      typeof content.image_url === "object" &&
+      "url" in content.image_url
+    ) {
+      source = content.image_url.url;
+    } else {
+      throw new Error("Please provide image as base64 encoded data URL");
+    }
+    const [dm, data] = source.split(",");
+    if (!dm.startsWith("data:")) {
+      throw new Error("Please provide image as base64 encoded data URL");
+    }
+
+    const [mimeType, encoding] = dm.replace(/^data:/, "").split(";");
+    if (encoding !== "base64") {
+      throw new Error("Please provide image as base64 encoded data URL");
+    }
+
+    return {
+      inlineData: {
+        data,
+        mimeType,
+      },
+    };
+  } else if (content.type === "media") {
+    return messageContentMedia(content);
+  } else if (content.type === "image") {
+    return _multimodalContentBlockToPart(
+      content as ContentBlock.Multimodal.Image,
+      "image/png"
+    );
+  } else if (content.type === "video") {
+    return _multimodalContentBlockToPart(
+      content as ContentBlock.Multimodal.Video,
+      "video/mp4"
+    );
+  } else if (content.type === "audio") {
+    return _multimodalContentBlockToPart(
+      content as ContentBlock.Multimodal.Audio,
+      "audio/mpeg"
+    );
+  } else if (content.type === "file") {
+    return _multimodalContentBlockToPart(
+      content as ContentBlock.Multimodal.File,
+      "application/octet-stream"
+    );
+  } else if (content.type === "text-plain") {
+    // text-plain blocks can have an inline text property
+    if (
+      "text" in content &&
+      typeof (content as ContentBlock.Multimodal.PlainText).text === "string"
+    ) {
+      return { text: (content as ContentBlock.Multimodal.PlainText).text! };
+    }
+    return _multimodalContentBlockToPart(
+      content as ContentBlock.Multimodal.PlainText,
+      "text/plain"
+    );
+  } else if (content.type === "tool_use") {
+    return {
+      functionCall: {
+        name: content.name,
+        args: content.input,
+      },
+    };
+  } else if (content.type === "tool_call") {
+    return {
+      functionCall: {
+        name: content.name,
+        args: content.args,
+      },
+    };
+  } else if (
+    content.type?.includes("/") &&
+    // Ensure it's a single slash.
+    content.type.split("/").length === 2 &&
+    "data" in content &&
+    typeof content.data === "string"
+  ) {
+    return {
+      inlineData: {
+        mimeType: content.type,
+        data: content.data,
+      },
+    };
+  } else if (content.type === "thinking") {
+    const thinkingContent = content as {
+      type: "thinking";
+      thinking: string;
+      signature?: string;
+    };
+    return {
+      text: thinkingContent.thinking,
+      thought: true,
+      ...(thinkingContent.signature
+        ? { thoughtSignature: thinkingContent.signature }
+        : {}),
+    } as Part;
+  } else if ("functionCall" in content) {
+    // No action needed here — function calls will be added later from message.tool_calls
+    return undefined;
+  } else {
+    if ("type" in content) {
+      throw new Error(`Unknown content type ${content.type}`);
+    } else {
+      throw new Error(`Unknown content ${JSON.stringify(content)}`);
+    }
+  }
+}
+
+export function convertMessageContentToParts(
+  message: BaseMessage,
+  isMultimodalModel: boolean,
+  previousMessages: BaseMessage[],
+  model?: string
+): Part[] {
+  if (isToolMessage(message)) {
+    const messageName =
+      message.name ??
+      inferToolNameFromPreviousMessages(message, previousMessages);
+    if (messageName === undefined) {
+      throw new Error(
+        `Google requires a tool name for each tool call response, and we could not infer a called tool name for ToolMessage "${message.id}" from your passed messages. Please populate a "name" field on that ToolMessage explicitly.`
+      );
+    }
+
+    const result = Array.isArray(message.content)
+      ? (message.content
+          .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
+          .filter((p) => p !== undefined) as Part[])
+      : message.content;
+
+    if (message.status === "error") {
+      return [
+        {
+          functionResponse: {
+            name: messageName,
+            // The API expects an object with an `error` field if the function call fails.
+            // `error` must be a valid object (not a string or array), so we wrap `message.content` here
+            response: { error: { details: result } },
+          },
+        },
+      ];
+    }
+
+    return [
+      {
+        functionResponse: {
+          name: messageName,
+          // again, can't have a string or array value for `response`, so we wrap it as an object here
+          response: { result },
+        },
+      },
+    ];
+  }
+
+  let functionCalls: Part[] = [];
+  const messageParts: Part[] = [];
+
+  if (typeof message.content === "string" && message.content) {
+    messageParts.push({ text: message.content });
+  }
+
+  if (Array.isArray(message.content)) {
+    messageParts.push(
+      ...(message.content
+        .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
+        .filter((p) => p !== undefined) as Part[])
+    );
+  }
+
+  const functionThoughtSignatures = message.additional_kwargs?.[
+    _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY
+  ] as Record<string, string>;
+
+  if (isAIMessage(message) && message.tool_calls?.length) {
+    functionCalls = message.tool_calls.map((tc) => {
+      const thoughtSignature = iife(() => {
+        if (tc.id) {
+          const signature = functionThoughtSignatures?.[tc.id];
+          if (signature) {
+            return signature;
+          }
+        }
+        if (model?.includes("gemini-3")) {
+          return DUMMY_SIGNATURE;
+        }
+        return "";
+      });
+      return {
+        functionCall: {
+          name: tc.name,
+          args: tc.args,
+        },
+        ...(thoughtSignature ? { thoughtSignature } : {}),
+      };
+    });
+  }
+
+  return [...messageParts, ...functionCalls];
+}
+
+export function convertBaseMessagesToContent(
+  messages: BaseMessage[],
+  isMultimodalModel: boolean,
+  convertSystemMessageToHumanContent: boolean = false,
+  model: string
+) {
+  return messages.reduce<{
+    content: Content[];
+    mergeWithPreviousContent: boolean;
+  }>(
+    (acc, message, index) => {
+      if (!isBaseMessage(message)) {
+        throw new Error("Unsupported message input");
+      }
+      const author = getMessageAuthor(message);
+      if (author === "system" && index !== 0) {
+        throw new Error("System message should be the first one");
+      }
+      const role = convertAuthorToRole(author);
+
+      const prevContent = acc.content[acc.content.length];
+      if (
+        !acc.mergeWithPreviousContent &&
+        prevContent &&
+        prevContent.role === role
+      ) {
+        throw new Error(
+          "Google Generative AI requires alternate messages between authors"
+        );
+      }
+
+      const parts = convertMessageContentToParts(
+        message,
+        isMultimodalModel,
+        messages.slice(0, index),
+        model
+      );
+
+      if (acc.mergeWithPreviousContent) {
+        const prevContent = acc.content[acc.content.length - 1];
+        if (!prevContent) {
+          throw new Error(
+            "There was a problem parsing your system message. Please try a prompt without one."
+          );
+        }
+        prevContent.parts = [...(prevContent.parts ?? []), ...parts];
+
+        return {
+          mergeWithPreviousContent: false,
+          content: acc.content,
+        };
+      }
+      let actualRole = role;
+      if (
+        actualRole === "function" ||
+        (actualRole === "system" && !convertSystemMessageToHumanContent)
+      ) {
+        // GenerativeAI API will throw an error if the role is not "user" or "model."
+        actualRole = "user";
+      }
+      const content: Content = {
+        role: actualRole,
+        parts,
+      };
+      return {
+        mergeWithPreviousContent:
+          author === "system" && !convertSystemMessageToHumanContent,
+        content: [...acc.content, content],
+      };
+    },
+    { content: [], mergeWithPreviousContent: false }
+  ).content;
+}
+
+export function mapGenerateContentResultToChatResult(
+  response: GenerateContentResponse,
+  extra?: {
+    usageMetadata: UsageMetadata | undefined;
+  }
+): ChatResult {
+  // if rejected or error, return empty generations with reason in filters
+  if (
+    !response.candidates ||
+    response.candidates.length === 0 ||
+    !response.candidates[0]
+  ) {
+    return {
+      generations: [],
+      llmOutput: {
+        filters: response.promptFeedback,
+      },
+    };
+  }
+  const [candidate] = response.candidates;
+  const { content: candidateContent, ...generationInfo } = candidate;
+  const functionCalls = candidateContent?.parts?.reduce(
+    (acc, p) => {
+      if ("functionCall" in p && p.functionCall) {
+        acc.push({
+          ...p,
+          id:
+            "id" in p.functionCall && typeof p.functionCall.id === "string"
+              ? p.functionCall.id
+              : uuidv4(),
+        });
+      }
+      return acc;
+    },
+    [] as (Part & { id: string })[]
+  );
+  let content: MessageContent | undefined;
+
+  const parts = candidateContent?.parts as GoogleGenerativeAIPart[] | undefined;
+
+  if (
+    Array.isArray(parts) &&
+    parts.length === 1 &&
+    "text" in parts[0] &&
+    parts[0].text &&
+    !parts[0].thought
+  ) {
+    content = parts[0].text;
+  } else if (Array.isArray(parts) && parts.length > 0) {
+    content = parts.map((p) => {
+      if (p.thought && "text" in p && p.text) {
+        return {
+          type: "thinking",
+          thinking: p.text,
+          ...(p.thoughtSignature ? { signature: p.thoughtSignature } : {}),
+        };
+      } else if ("text" in p) {
+        return {
+          type: "text",
+          text: p.text,
+        };
+      } else if ("inlineData" in p) {
+        return {
+          type: "inlineData",
+          inlineData: p.inlineData,
+        };
+      } else if ("functionCall" in p) {
+        return {
+          type: "functionCall",
+          functionCall: p.functionCall,
+        };
+      } else if ("functionResponse" in p) {
+        return {
+          type: "functionResponse",
+          functionResponse: p.functionResponse,
+        };
+      } else if ("fileData" in p) {
+        return {
+          type: "fileData",
+          fileData: p.fileData,
+        };
+      } else if ("executableCode" in p) {
+        return {
+          type: "executableCode",
+          executableCode: p.executableCode,
+        };
+      } else if ("codeExecutionResult" in p) {
+        return {
+          type: "codeExecutionResult",
+          codeExecutionResult: p.codeExecutionResult,
+        };
+      }
+      return p;
+    });
+  } else {
+    // no content returned - likely due to abnormal stop reason, e.g. malformed function call
+    content = [];
+  }
+
+  const functionThoughtSignatures = functionCalls?.reduce(
+    (acc, fc) => {
+      if ("thoughtSignature" in fc && typeof fc.thoughtSignature === "string") {
+        acc[fc.id] = fc.thoughtSignature;
+      }
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content) && content.length > 0) {
+    const block = content.find((b) => "text" in b) as
+      | { text: string }
+      | undefined;
+    text = block?.text ?? text;
+  }
+
+  const generation: ChatGeneration = {
+    text,
+    message: new AIMessage({
+      content: content ?? "",
+      tool_calls: functionCalls?.map((fc) => ({
+        type: "tool_call",
+        id: fc.id,
+        name: fc.functionCall?.name ?? "",
+        args: fc.functionCall?.args ?? {},
+      })),
+      additional_kwargs: {
+        ...generationInfo,
+        [_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY]: functionThoughtSignatures,
+      },
+      // Tag the provider so `AIMessage.contentBlocks` runs the google-genai
+      // translator, which maps our `thinking` parts to standard `reasoning`
+      // content blocks. The streaming path already sets this on each chunk.
+      response_metadata: {
+        model_provider: "google-genai",
+      },
+      usage_metadata: extra?.usageMetadata,
+    }),
+    generationInfo,
+  };
+
+  return {
+    generations: [generation],
+    llmOutput: {
+      tokenUsage: {
+        promptTokens: extra?.usageMetadata?.input_tokens,
+        completionTokens: extra?.usageMetadata?.output_tokens,
+        totalTokens: extra?.usageMetadata?.total_tokens,
+      },
+    },
+  };
+}
+
+export function convertResponseContentToChatGenerationChunk(
+  response: GenerateContentResponse,
+  extra: {
+    usageMetadata?: UsageMetadata | undefined;
+    index: number;
+  }
+): ChatGenerationChunk | null {
+  if (!response.candidates || response.candidates.length === 0) {
+    return null;
+  }
+  const [candidate] = response.candidates;
+  const { content: candidateContent, ...generationInfo } = candidate;
+  const functionCalls = candidateContent?.parts?.reduce(
+    (acc, p) => {
+      if ("functionCall" in p && p.functionCall) {
+        acc.push({
+          ...p,
+          id:
+            "id" in p.functionCall && typeof p.functionCall.id === "string"
+              ? p.functionCall.id
+              : uuidv4(),
+        });
+      }
+      return acc;
+    },
+    [] as (Part & { id: string })[]
+  );
+  let content: MessageContent | undefined;
+  const streamParts = candidateContent?.parts as
+    | GoogleGenerativeAIPart[]
+    | undefined;
+
+  // Checks if all parts are plain text (no thought flags). If so, join as string.
+  if (
+    Array.isArray(streamParts) &&
+    streamParts.every((p) => "text" in p && !p.thought)
+  ) {
+    content = streamParts.map((p) => p.text).join("");
+  } else if (Array.isArray(streamParts)) {
+    content = streamParts.map((p) => {
+      if (p.thought && "text" in p && p.text) {
+        return {
+          type: "thinking",
+          thinking: p.text,
+          ...(p.thoughtSignature ? { signature: p.thoughtSignature } : {}),
+        };
+      } else if ("text" in p) {
+        return {
+          type: "text",
+          text: p.text,
+        };
+      } else if ("inlineData" in p) {
+        return {
+          type: "inlineData",
+          inlineData: p.inlineData,
+        };
+      } else if ("functionCall" in p) {
+        return {
+          type: "functionCall",
+          functionCall: p.functionCall,
+        };
+      } else if ("functionResponse" in p) {
+        return {
+          type: "functionResponse",
+          functionResponse: p.functionResponse,
+        };
+      } else if ("fileData" in p) {
+        return {
+          type: "fileData",
+          fileData: p.fileData,
+        };
+      } else if ("executableCode" in p) {
+        return {
+          type: "executableCode",
+          executableCode: p.executableCode,
+        };
+      } else if ("codeExecutionResult" in p) {
+        return {
+          type: "codeExecutionResult",
+          codeExecutionResult: p.codeExecutionResult,
+        };
+      }
+      return p;
+    });
+  } else {
+    // no content returned - likely due to abnormal stop reason, e.g. malformed function call
+    content = [];
+  }
+
+  let text = "";
+  if (content && typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    const block = content.find((b) => "text" in b) as
+      | { text: string }
+      | undefined;
+    text = block?.text ?? "";
+  }
+
+  const toolCallChunks: ToolCallChunk[] = [];
+  if (functionCalls) {
+    toolCallChunks.push(
+      ...functionCalls.map((fc) => ({
+        type: "tool_call_chunk" as const,
+        id: fc.id,
+        name: fc.functionCall?.name,
+        args: JSON.stringify(fc.functionCall?.args),
+      }))
+    );
+  }
+
+  const functionThoughtSignatures = functionCalls?.reduce(
+    (acc, fc) => {
+      if ("thoughtSignature" in fc && typeof fc.thoughtSignature === "string") {
+        acc[fc.id] = fc.thoughtSignature;
+      }
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+
+  return new ChatGenerationChunk({
+    text,
+    message: new AIMessageChunk({
+      content: content || "",
+      name: !candidateContent ? undefined : candidateContent.role,
+      tool_call_chunks: toolCallChunks,
+      // Each chunk can have unique "generationInfo", and merging strategy is unclear,
+      // so leave blank for now.
+      additional_kwargs: {
+        [_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY]: functionThoughtSignatures,
+      },
+      response_metadata: {
+        model_provider: "google-genai",
+      },
+      usage_metadata: extra.usageMetadata,
+    }),
+    generationInfo,
+  });
+}
+
+export function convertToGenerativeAITools(
+  tools: GoogleGenerativeAIToolType[]
+): GoogleGenerativeAITool[] {
+  if (
+    tools.every(
+      (tool) =>
+        "functionDeclarations" in tool &&
+        Array.isArray(tool.functionDeclarations)
+    )
+  ) {
+    return tools as GoogleGenerativeAITool[];
+  }
+  return [
+    {
+      functionDeclarations: tools.map(
+        (tool): GenerativeAIFunctionDeclaration => {
+          if (isLangChainTool(tool)) {
+            const jsonSchema = schemaToGenerativeAIParameters(tool.schema);
+            // `jsonSchema` carries JSON-Schema-style (lowercase) type values at
+            // runtime, while the SDK's `Type` enum is uppercase, so compare as
+            // a plain string.
+            if (
+              (jsonSchema.type as string) === "object" &&
+              Object.keys(jsonSchema.properties ?? {}).length === 0
+            ) {
+              return {
+                name: tool.name,
+                description: tool.description,
+              };
+            }
+            assertNoEmptyStringEnums(jsonSchema, tool.name);
+            return {
+              name: tool.name,
+              description: tool.description,
+              parameters: jsonSchema,
+            };
+          }
+          if (isOpenAITool(tool)) {
+            const params = jsonSchemaToGeminiParameters(
+              tool.function.parameters
+            );
+            assertNoEmptyStringEnums(params, tool.function.name);
+            return {
+              name: tool.function.name,
+              description:
+                tool.function.description ?? `A function available to call.`,
+              parameters: params,
+            };
+          }
+          return tool as unknown as GenerativeAIFunctionDeclaration;
+        }
+      ),
+    },
+  ];
+}
+
+export function convertUsageMetadata(
+  usageMetadata: GenerateContentResponse["usageMetadata"],
+  model: string
+): UsageMetadata {
+  // The Gemini API reports thinking/reasoning tokens separately in
+  // `thoughtsTokenCount`; `candidatesTokenCount` excludes them, while
+  // `totalTokenCount` includes them. LangChain expects `output_tokens` to
+  // cover all generated tokens (so input + output === total), with reasoning
+  // broken out under `output_token_details.reasoning`.
+  const reasoningTokens = usageMetadata?.thoughtsTokenCount ?? 0;
+  const output: UsageMetadata = {
+    input_tokens: usageMetadata?.promptTokenCount ?? 0,
+    output_tokens: (usageMetadata?.candidatesTokenCount ?? 0) + reasoningTokens,
+    total_tokens: usageMetadata?.totalTokenCount ?? 0,
+  };
+  if (reasoningTokens) {
+    output.output_token_details = {
+      ...output.output_token_details,
+      reasoning: reasoningTokens,
+    };
+  }
+  if (usageMetadata?.cachedContentTokenCount) {
+    output.input_token_details ??= {};
+    output.input_token_details.cache_read =
+      usageMetadata.cachedContentTokenCount;
+  }
+  // Gemini 3 Pro models have bracket-based pricing above a 200k-token context,
+  // so report how much of the input fell into the higher tier.
+  // FIXME(hntrl): move this usageMetadata calculation elsewhere
+  if (model.startsWith("gemini-3") && model.includes("pro")) {
+    const over200k = Math.max(0, (usageMetadata?.promptTokenCount ?? 0) - 200000);
+    const cachedOver200k = Math.max(
+      0,
+      (usageMetadata?.cachedContentTokenCount ?? 0) - 200000
+    );
+    if (over200k) {
+      output.input_token_details = {
+        ...output.input_token_details,
+        over_200k: over200k,
+      } as InputTokenDetails;
+    }
+    if (cachedOver200k) {
+      output.input_token_details = {
+        ...output.input_token_details,
+        cache_read_over_200k: cachedOver200k,
+      } as InputTokenDetails;
+    }
+  }
+  return output;
+}

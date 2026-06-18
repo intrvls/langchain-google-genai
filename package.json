@@ -1,0 +1,68 @@
+{
+  "name": "@intrvls/langchain-google-genai",
+  "version": "2.1.24",
+  "description": "Standalone port of @langchain/google-genai 2.1.24, re-based onto the new @google/genai SDK and pinned to the @langchain/core line n8n ships (1.1.x).",
+  "author": "Intrvls",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:intrvls/langchain-google-genai.git"
+  },
+  "homepage": "https://github.com/intrvls/langchain-google-genai/",
+  "scripts": {
+    "build": "tsdown",
+    "build:compile": "tsdown",
+    "clean": "rm -rf dist/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:single": "vitest run",
+    "test:int": "vitest run --mode int"
+  },
+  "dependencies": {
+    "@google/genai": "^2.8.0",
+    "uuid": "^11.1.0"
+  },
+  "peerDependencies": {
+    "@langchain/core": "^1.1.30"
+  },
+  "devDependencies": {
+    "@langchain/core": "1.1.41",
+    "@tsconfig/recommended": "^1.0.3",
+    "dotenv": "^17.4.0",
+    "dpdm": "^3.14.0",
+    "tsdown": "^0.21.7",
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.8",
+    "zod": "^3.25.76"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "input": "./src/index.ts",
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "module": "./dist/index.mjs"
+}
