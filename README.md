@@ -12,10 +12,30 @@ This is a standalone port of the official [`@langchain/google-genai`](https://ww
 
 It keeps the same public API (`ChatGoogleGenerativeAI`, `GoogleGenerativeAIEmbeddings`) so it can be used as a drop-in replacement.
 
+## Version compatibility
+
+This port follows its own version line as of **3.0.0** and no longer mirrors upstream's `2.1.x` numbering. The table below describes the current release.
+
+| | Version | Notes |
+| --- | --- | --- |
+| **This package** | `3.0.0-alpha.0` | Independent version line (see [CHANGELOG](./CHANGELOG.md)). |
+| **Mirrors upstream** | `@langchain/google-genai` **2.1.24** | The upstream release this port is rebased from — the last line targeting `@langchain/core` 1.1.x. Not the version you install. |
+| **`@langchain/core`** | peer `^1.1.30` | Supplied by the host as a `peerDependency`. Tested against **1.1.41**, the version n8n's [`@n8n/n8n-nodes-langchain`](https://www.npmjs.com/package/@n8n/n8n-nodes-langchain) ships. Must resolve to a single instance at runtime. Do **not** use core `≥1.2.0` — upstream `2.2.0+` requires APIs n8n does not ship. |
+| **`@google/genai`** | `^2.8.0` | Google's current unified GenAI SDK (replaces the deprecated `@google/generative-ai`). Bundled dependency. |
+| **Node.js** | `>=20` | |
+
+> **Why pinned to core 1.1.x?** This is built for use inside a custom n8n community node, and everything in an n8n process must resolve to the one `@langchain/core` instance n8n provides (1.1.41). Rebasing on upstream 2.1.24 — rather than 2.2.0+ — keeps the port on the core 1.1.x line so it stays compatible.
+
 ## Installation
 
 ```bash npm2yarn
 npm install @intrvls/langchain-google-genai @langchain/core
+```
+
+The current release is an alpha. To install it, use the `alpha` tag:
+
+```bash
+npm install @intrvls/langchain-google-genai@alpha @langchain/core
 ```
 
 This package, along with the main LangChain package, depends on [`@langchain/core`](https://npmjs.com/package/@langchain/core/).
@@ -28,7 +48,7 @@ You can do so by adding appropriate field to your project's `package.json` like 
   "version": "0.0.0",
   "dependencies": {
     "@langchain/core": "^1.1.30",
-    "@intrvls/langchain-google-genai": "^2.1.24"
+    "@intrvls/langchain-google-genai": "^3.0.0-alpha.0"
   },
   "resolutions": {
     "@langchain/core": "^1.1.30"

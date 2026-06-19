@@ -1,4 +1,20 @@
-# @langchain/google-genai
+# @intrvls/langchain-google-genai
+
+## 3.0.0-alpha.0
+
+### Major Changes
+
+This is the first release of `@intrvls/langchain-google-genai` on its own independent version line, decoupled from upstream `@langchain/google-genai`. Prior `2.x` releases mirrored upstream patch versions; from `3.0.0` onward this port versions independently.
+
+- **Independent versioning.** The port no longer tracks upstream's `2.1.x` numbering. It now follows its own semver, starting at `3.0.0`, so port-specific changes can be released without colliding with upstream version numbers.
+- **Rebased onto the new `@google/genai` SDK.** Built on Google's current unified [`@google/genai`](https://www.npmjs.com/package/@google/genai) SDK instead of the deprecated legacy `@google/generative-ai` SDK, restoring access to newer Gemini models and capabilities.
+- **Pinned to n8n's `@langchain/core` line.** Targets `@langchain/core` `1.1.x` (peer `^1.1.30`) — the line n8n's [`@n8n/n8n-nodes-langchain`](https://www.npmjs.com/package/@n8n/n8n-nodes-langchain) ships — so everything resolves to a single core instance at runtime inside a custom n8n community node.
+
+The public API (`ChatGoogleGenerativeAI`, `GoogleGenerativeAIEmbeddings`) is unchanged and remains a drop-in replacement.
+
+---
+
+The history below is inherited from upstream `@langchain/google-genai`, on which this port is based.
 
 ## 2.2.0
 
