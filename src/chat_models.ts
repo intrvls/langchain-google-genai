@@ -228,6 +228,17 @@ export interface GoogleGenerativeAIChatInput
    * ```
    */
   cachedContent?: string;
+
+  /**
+   * Optional. Default JSON schema (Gemini Schema / OpenAPI subset) to constrain
+   * the model output. Unlike passing `responseSchema` as a per-call option (which
+   * forces `.withConfig`, returning a `RunnableBinding` that loses `.bindTools()`),
+   * setting it here keeps the instance a real `ChatGoogleGenerativeAI` — so
+   * `.bindTools()` and tool-calling agents keep working while the schema is
+   * forwarded on every request. A `responseSchema` passed explicitly at call time
+   * takes precedence over this default. Implies JSON output. Gemini 2.5+ only.
+   */
+  responseSchema?: Schema;
 }
 
 /**
@@ -672,6 +683,8 @@ export class ChatGoogleGenerativeAI
 
   cachedContent?: string;
 
+  responseSchema?: Schema;
+
   private client: GoogleGenAI;
 
   get _isMultimodalModel() {
@@ -768,6 +781,8 @@ export class ChatGoogleGenerativeAI
 
     this.cachedContent = fields.cachedContent ?? this.cachedContent;
 
+    this.responseSchema = fields.responseSchema ?? this.responseSchema;
+
     // The `@google/genai` client is stateless: generation parameters
     // (model, safetySettings, generationConfig, cachedContent, ...) are passed
     // per request via `invocationParams` / `_buildGenerateContentRequest`
@@ -847,6 +862,10 @@ export class ChatGoogleGenerativeAI
         })
       : undefined;
 
+    // A `responseSchema` passed explicitly at call time wins over the default
+    // configured on the instance.
+    const responseSchema = options?.responseSchema ?? this.responseSchema;
+
     return {
       ...(toolsAndConfig?.tools ? { tools: toolsAndConfig.tools } : {}),
       ...(toolsAndConfig?.toolConfig
@@ -866,9 +885,9 @@ export class ChatGoogleGenerativeAI
       ...(this.thinkingConfig
         ? { thinkingConfig: this.thinkingConfig as ThinkingConfig }
         : {}),
-      ...(options?.responseSchema
+      ...(responseSchema
         ? {
-            responseSchema: options.responseSchema,
+            responseSchema,
             responseMimeType: "application/json",
           }
         : {}),
