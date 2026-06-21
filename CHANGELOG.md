@@ -1,5 +1,15 @@
 # @intrvls/langchain-google-genai
 
+## 3.0.0-alpha.1
+
+### Minor Changes
+
+- **`responseSchema` as a constructor option.** `responseSchema` can now be set on `GoogleGenerativeAIChatInput` instead of only per call. Setting it at construction keeps the instance a real `ChatGoogleGenerativeAI` (so `.bindTools()` and tool-calling agents keep working) and forwards the schema on every request; previously a default schema required `.withConfig()`, which returns a `RunnableBinding` that loses `.bindTools()`. A `responseSchema` passed explicitly at call time still takes precedence.
+
+### Patch Changes
+
+- **Built-in tools alongside function calling.** Gemini rejects requests that combine a server-side built-in tool (`googleSearch`, `urlContext`, `codeExecution`, ...) with function calling unless `toolConfig.includeServerSideToolInvocations` is set. The wrapper now detects a built-in tool among the bound tools and injects the flag, preserving any `toolConfig` already produced from `toolChoice`.
+
 ## 3.0.0-alpha.0
 
 ### Major Changes

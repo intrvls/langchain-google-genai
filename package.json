@@ -1,6 +1,6 @@
 {
   "name": "@intrvls/langchain-google-genai",
-  "version": "3.0.0-alpha.0",
+  "version": "3.0.0-alpha.1",
   "description": "Standalone port of @langchain/google-genai 2.1.24, re-based onto the new @google/genai SDK and pinned to the @langchain/core line n8n ships (1.1.x).",
   "author": "Ervin Chai <ervin.chai1108@gmail.com>",
   "license": "MIT",
