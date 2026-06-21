@@ -631,6 +631,30 @@ function isGemini3OrLater(model: string): boolean {
   return match ? Number(match[1]) >= 3 : false;
 }
 
+/** Native server-side tool keys on the `@google/genai` `Tool` interface. */
+const BUILTIN_TOOL_KEYS = [
+  "googleSearch",
+  "googleSearchRetrieval",
+  "urlContext",
+  "codeExecution",
+  "enterpriseWebSearch",
+  "fileSearch",
+];
+
+/**
+ * True when any bound tool is a bare server-side built-in config object
+ * (e.g. `{ googleSearch: {} }`) rather than a function-declaration tool.
+ */
+function hasBuiltinTool(tools: unknown): boolean {
+  if (!Array.isArray(tools)) return false;
+  return tools.some(
+    (tool) =>
+      typeof tool === "object" &&
+      tool !== null &&
+      BUILTIN_TOOL_KEYS.some((key) => key in tool)
+  );
+}
+
 export class ChatGoogleGenerativeAI
   extends BaseChatModel<GoogleGenerativeAIChatCallOptions, AIMessageChunk>
   implements GoogleGenerativeAIChatInput
@@ -862,15 +886,22 @@ export class ChatGoogleGenerativeAI
         })
       : undefined;
 
+    // Gemini rejects requests that combine a server-side built-in tool (e.g.
+    // `googleSearch`, `urlContext`, `codeExecution`) with function calling
+    // unless `toolConfig.includeServerSideToolInvocations` is set. Detect a
+    // built-in tool among the bound tools and inject the flag, merging with any
+    // toolConfig already produced (e.g. from `toolChoice`).
+    const toolConfig = hasBuiltinTool(options?.tools)
+      ? { ...toolsAndConfig?.toolConfig, includeServerSideToolInvocations: true }
+      : toolsAndConfig?.toolConfig;
+
     // A `responseSchema` passed explicitly at call time wins over the default
     // configured on the instance.
     const responseSchema = options?.responseSchema ?? this.responseSchema;
 
     return {
       ...(toolsAndConfig?.tools ? { tools: toolsAndConfig.tools } : {}),
-      ...(toolsAndConfig?.toolConfig
-        ? { toolConfig: toolsAndConfig.toolConfig }
-        : {}),
+      ...(toolConfig ? { toolConfig } : {}),
       ...(this.safetySettings ? { safetySettings: this.safetySettings } : {}),
       ...(this.cachedContent ? { cachedContent: this.cachedContent } : {}),
       stopSequences: this.stopSequences,
